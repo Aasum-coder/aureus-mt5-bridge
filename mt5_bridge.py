@@ -32,14 +32,76 @@ except ImportError:
     mt5 = None
 
 
+ONLY = os.environ.get("AUREUS_LOGIN", "33849261").strip()
+CHOSEN: str | None = None
+
+
+def terminal_paths() -> list[str]:
+    found: list[str] = []
+    forced = os.environ.get("MT5_PATH", "").strip()
+    if forced:
+        found.append(forced)
+    try:
+        import subprocess
+
+        raw = subprocess.check_output(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name = 'terminal64.exe'\" | Select-Object -ExpandProperty ExecutablePath",
+            ],
+            text=True,
+            timeout=20,
+        )
+        for line in raw.splitlines():
+            path = line.strip()
+            if path and path not in found:
+                found.append(path)
+    except Exception:
+        pass
+    return found
+
+
+def attach() -> None:
+    """Connect the API to the AUREUS terminal only. shutdown() does not log Apex out."""
+    global CHOSEN
+    if mt5 is None:
+        raise RuntimeError("MetaTrader5 is not installed. Run: pip install MetaTrader5")
+    paths = terminal_paths() or [""]
+    seen: list[str] = []
+    for path in paths:
+        mt5.shutdown()
+        ok = mt5.initialize(path) if path else mt5.initialize()
+        if not ok:
+            continue
+        info = mt5.account_info()
+        if info is None:
+            mt5.shutdown()
+            continue
+        seen.append(f"{info.login} ({path or 'default'})")
+        if str(info.login) == ONLY:
+            CHOSEN = path
+            print(f"AUREUS locked to {info.login}. Other terminals are left logged in.")
+            return
+        mt5.shutdown()
+    raise RuntimeError(
+        f"AUREUS account {ONLY} was not found. Saw: {', '.join(seen) or 'no terminal'}. No order will be sent."
+    )
+
+
 def ensure() -> None:
     if mt5 is None:
         raise RuntimeError("MetaTrader5 is not installed. Run: pip install MetaTrader5")
-    if not mt5.initialize():
-        raise RuntimeError(f"MetaTrader 5 is not running or not logged in. {mt5.last_error()}")
+    if CHOSEN is None:
+        attach()
+        return
+    ok = mt5.initialize(CHOSEN) if CHOSEN else mt5.initialize()
+    if not ok:
+        raise RuntimeError(f"The AUREUS terminal is not running. {mt5.last_error()}")
     info = mt5.account_info()
-    if info is None:
-        raise RuntimeError("MetaTrader 5 has no logged-in account.")
+    if info is None or str(info.login) != ONLY:
+        raise RuntimeError(f"Refusing to trade {getattr(info, 'login', 'unknown')}. AUREUS only trades {ONLY}.")
 
 
 def account():
@@ -398,5 +460,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"AUREUS bridge on {HOST}:{PORT}. MetaTrader must stay logged in.")
+    try:
+        attach()
+    except Exception as exc:
+        print(exc)
+        raise SystemExit(1)
+    print(f"AUREUS bridge on {HOST}:{PORT}. Trading only {ONLY}.")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
