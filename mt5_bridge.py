@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,8 +25,12 @@ from urllib.parse import parse_qs, urlparse
 HOST = os.environ.get("AUREUS_BRIDGE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("AUREUS_BRIDGE_PORT", "5000"))
 KEY = os.environ.get("AUREUS_BRIDGE_KEY", "").strip()
-TOKENS: dict[str, float] = {}
+TOKENS: dict[str, dict] = {}
 TOKEN_TTL = 12 * 60 * 60
+MT5_LOCK = threading.Lock()
+EXEC_DIR = os.environ.get("AUREUS_EXEC_DIR", r"C:\AUREUS-EXEC")
+MODE = "price"
+TRADE_LOGIN = ""
 
 try:
     import MetaTrader5 as mt5
@@ -83,6 +89,8 @@ def attach() -> None:
         if str(info.login) == ONLY:
             CHOSEN = path
             print(f"AUREUS locked to {info.login}. Other terminals are left logged in.")
+            global MODE
+            MODE = "price"
             return
         mt5.shutdown()
     raise RuntimeError(
@@ -91,17 +99,153 @@ def attach() -> None:
 
 
 def ensure() -> None:
+    global MODE
     if mt5 is None:
         raise RuntimeError("MetaTrader5 is not installed. Run: pip install MetaTrader5")
+    if MODE == "trade":
+        info = mt5.account_info()
+        if info is not None and str(info.login) == TRADE_LOGIN:
+            return
+        raise RuntimeError("The member terminal is not logged in. No order was sent.")
     if CHOSEN is None:
         attach()
+        MODE = "price"
         return
+    info = mt5.account_info()
+    if info is not None and str(info.login) == ONLY and MODE == "price":
+        return
+    mt5.shutdown()
     ok = mt5.initialize(CHOSEN) if CHOSEN else mt5.initialize()
     if not ok:
         raise RuntimeError(f"The AUREUS terminal is not running. {mt5.last_error()}")
     info = mt5.account_info()
     if info is None or str(info.login) != ONLY:
-        raise RuntimeError(f"Refusing to trade {getattr(info, 'login', 'unknown')}. AUREUS only trades {ONLY}.")
+        raise RuntimeError(f"Refusing to use {getattr(info, 'login', 'unknown')} as the price terminal.")
+    MODE = "price"
+
+
+def allow_live(folder: str) -> None:
+    config = os.path.join(folder, "config")
+    os.makedirs(config, exist_ok=True)
+    path = os.path.join(config, "common.ini")
+    text = ""
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            text = handle.read()
+    if "AllowLiveTrading=1" not in text:
+        text += "\n[Common]\nAllowLiveTrading=1\n[Experts]\nEnabled=1\nAllowLiveTrading=1\n"
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+
+def ensure_exec_copy() -> str:
+    exe = os.path.join(EXEC_DIR, "terminal64.exe")
+    if os.path.isfile(exe):
+        allow_live(EXEC_DIR)
+        return exe
+    if not CHOSEN:
+        raise RuntimeError("The price terminal path is unknown, so a member terminal was not created.")
+    source = os.path.dirname(CHOSEN)
+    if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(EXEC_DIR)):
+        raise RuntimeError("Refusing to copy the price terminal onto itself.")
+    os.makedirs(EXEC_DIR, exist_ok=True)
+    print(f"Copying a member terminal from {source}")
+    completed = subprocess.run(
+        [
+            "robocopy",
+            source,
+            EXEC_DIR,
+            "/E",
+            "/NFL",
+            "/NDL",
+            "/NJH",
+            "/NJS",
+            "/nc",
+            "/ns",
+            "/np",
+            "/XD",
+            "bases",
+            "logs",
+            "Tester",
+            "temp",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode >= 8 or not os.path.isfile(exe):
+        raise RuntimeError("Could not prepare the member terminal. No order was sent.")
+    allow_live(EXEC_DIR)
+    print("Member terminal is ready.")
+    return exe
+
+
+def login_trade(login: str, password: str, server: str) -> None:
+    global MODE, TRADE_LOGIN
+    if MODE == "trade" and TRADE_LOGIN == str(login):
+        info = mt5.account_info()
+        if info is not None and str(info.login) == str(login):
+            return
+    if not password:
+        raise RuntimeError("Enter the master password. No order was sent.")
+    exe = ensure_exec_copy()
+    mt5.shutdown()
+    MODE = "none"
+    ok = mt5.initialize(
+        path=exe,
+        login=int(login),
+        password=password,
+        server=server or "PUPrime-Live2",
+        timeout=90_000,
+        portable=True,
+    )
+    info = mt5.account_info() if ok else None
+    if not ok or info is None or str(info.login) != str(login):
+        err = mt5.last_error()
+        MODE = "price"
+        try:
+            ensure()
+        except Exception:
+            MODE = "none"
+        text = " ".join(str(part) for part in err) if isinstance(err, tuple) else str(err)
+        if "password" in text.lower() or "author" in text.lower():
+            raise RuntimeError("PU Prime did not accept the login. Nothing was sent.")
+        raise RuntimeError(f"Could not open account {login}. {text}. Nothing was sent.")
+    MODE = "trade"
+    TRADE_LOGIN = str(login)
+    print(f"Member terminal logged into {login}. Price terminal {ONLY} was left logged in.")
+
+
+def bind(row: dict) -> None:
+    global MODE
+    if row.get("mode") == "trade" and str(row.get("login")) != ONLY:
+        login_trade(str(row["login"]), str(row.get("password") or ""), str(row.get("server") or "PUPrime-Live2"))
+        return
+    if MODE == "trade":
+        MODE = "price"
+    ensure()
+
+
+def issue(mode: str, login: str, password: str = "", server: str = "") -> str:
+    token = secrets.token_hex(16)
+    TOKENS[token] = {
+        "at": time.time(),
+        "mode": mode,
+        "login": str(login),
+        "password": password,
+        "server": server,
+    }
+    return token
+
+
+def session(query: dict[str, list[str]]) -> dict | None:
+    token = (query.get("id") or [""])[0]
+    row = TOKENS.get(token)
+    if not isinstance(row, dict) or time.time() - float(row.get("at", 0)) > TOKEN_TTL:
+        if token:
+            TOKENS.pop(token, None)
+        return None
+    row["at"] = time.time()
+    return row
 
 
 def account():
@@ -121,12 +265,7 @@ def auth_ok(query: dict[str, list[str]], header: str | None) -> bool:
 
 
 def session_ok(query: dict[str, list[str]]) -> bool:
-    token = (query.get("id") or [""])[0]
-    issued = TOKENS.get(token)
-    if not token or issued is None or time.time() - issued > TOKEN_TTL:
-        return False
-    TOKENS[token] = time.time()
-    return True
+    return session(query) is not None
 
 
 def one(query: dict[str, list[str]], name: str, default: str = "") -> str:
@@ -389,6 +528,7 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/health" and not auth_ok(query, self.headers.get("Authorization")):
             self.reply(401, {"message": "Bridge key rejected."})
             return
+        MT5_LOCK.acquire()
         try:
             if path == "/health":
                 info = account()
@@ -397,25 +537,37 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/Search":
                 self.reply(200, [{"companyName": "PU Prime Ltd", "results": [{"name": "PUPrime-Live2", "access": []}]}])
                 return
+            if path == "/TradeConnect":
+                login = one(query, "user")
+                password = one(query, "password")
+                server = one(query, "server", "PUPrime-Live2")
+                if not login:
+                    raise RuntimeError("Account number is missing. Nothing was sent.")
+                if str(login) == ONLY:
+                    ensure()
+                    self.reply(200, issue("price", ONLY))
+                    return
+                login_trade(login, password, server)
+                self.reply(200, issue("trade", login, password, server))
+                return
             if path in ("/Connect", "/ConnectEx"):
                 info = account()
                 login = one(query, "user")
                 if login and str(info.login) != login:
                     self.reply(401, {"message": f"This terminal is logged into {info.login}, not {login}."})
                     return
-                token = secrets.token_hex(16)
-                TOKENS[token] = time.time()
-                self.reply(200, token)
+                self.reply(200, issue("price", ONLY))
                 return
-            if not session_ok(query):
+            row = session(query)
+            if row is None:
                 self.reply(401, {"message": "Bridge session expired. Connect again."})
                 return
+            bind(row)
             if path == "/GetQuote":
                 self.reply(200, quote_of(one(query, "symbol", "XAUUSD")))
                 return
             if path == "/SymbolList":
-                ensure()
-                names = [row.name for row in (mt5.symbols_get() or [])]
+                names = [item.name for item in (mt5.symbols_get() or [])]
                 self.reply(200, names)
                 return
             if path == "/SymbolParams":
@@ -457,6 +609,8 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, {"message": f"{path} is not on this bridge."})
         except Exception as error:
             self.reply(400, {"message": str(error)})
+        finally:
+            MT5_LOCK.release()
 
 
 if __name__ == "__main__":
@@ -465,5 +619,5 @@ if __name__ == "__main__":
     except Exception as exc:
         print(exc)
         raise SystemExit(1)
-    print(f"AUREUS bridge on {HOST}:{PORT}. Trading only {ONLY}.")
+    print(f"AUREUS bridge on {HOST}:{PORT}. Prices stay on {ONLY}. Member orders use their own login.")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
